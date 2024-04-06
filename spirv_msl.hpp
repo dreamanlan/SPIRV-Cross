@@ -1201,6 +1201,10 @@ protected:
 	std::string index_buffer_var_name = "spvIndices";
 	spv::Op previous_instruction_opcode = spv::OpNop;
 
+	std::string last_normal_sampler_name = "";
+	std::string last_array_sampler_name = "";
+	std::map<std::string, std::string> sampler_reuses;
+
 	// Must be ordered since declaration is in a specific order.
 	std::map<uint32_t, MSLConstexprSampler> constexpr_samplers_by_id;
 	std::unordered_map<SetBindingPair, MSLConstexprSampler, InternalHasher> constexpr_samplers_by_binding;

@@ -10780,6 +10780,10 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
 
 	local_variable_names = resource_names;
 	string decl;
+    
+    last_normal_sampler_name = "";
+	last_array_sampler_name = "";
+    sampler_reuses.clear();
 
 	processing_entry_point = func.self == ir.default_entry_point;
 
@@ -11577,8 +11581,12 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		case Dim2D:
 			if (offset_type->vecsize > 2)
 				offset_expr = enclose_expression(offset_expr) + ".xy";
-
-			farg_str += ", " + offset_expr;
+                
+            if (offset_type->basetype == SPIRType::Int)
+                farg_str += ", " + offset_expr;
+            else
+                farg_str += ", int2(" + offset_expr + ")";
+                
 			break;
 
 		case Dim3D:
@@ -12029,14 +12037,22 @@ string CompilerMSL::to_sampler_expression(uint32_t id)
 	if (combined)
 		samp_id = combined->sampler;
 
-	if (index == string::npos)
-		return samp_id ? to_expression(samp_id) : expr + sampler_name_suffix;
+    std::string tmp;
+    if (index == string::npos) {
+        //return samp_id ? to_expression(samp_id) : expr + sampler_name_suffix;
+        tmp = samp_id ? to_expression(samp_id) : expr + sampler_name_suffix;
+    }
 	else
 	{
 		auto image_expr = expr.substr(0, index);
-		auto array_expr = expr.substr(index);
-		return samp_id ? to_expression(samp_id) : (image_expr + sampler_name_suffix + array_expr);
+		//auto array_expr = expr.substr(index);
+		//return samp_id ? to_expression(samp_id) : (image_expr + sampler_name_suffix + array_expr);
+        tmp = samp_id ? to_expression(samp_id) : (image_expr + sampler_name_suffix);
 	}
+    auto&& it = sampler_reuses.find(tmp);
+    if (it != sampler_reuses.end())
+        return it->second;
+    return tmp;
 }
 
 string CompilerMSL::to_swizzle_expression(uint32_t id)
@@ -13727,13 +13743,39 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
 			break;
 		}
 		case SPIRType::Sampler:
-			if (!ep_args.empty())
-				ep_args += ", ";
-			ep_args += sampler_type(type, var_id, false) + " " + r.name;
-			if (is_var_runtime_size_array(var))
+			if (is_var_runtime_size_array(var)) {
+				if (!ep_args.empty())
+					ep_args += ", ";
+				ep_args += sampler_type(type, var_id, false) + " " + r.name;
 				ep_args += "_ [[buffer(" + convert_to_string(r.index) + ")]]";
-			else
+			}
+			else if (r.index < 16) {
+				if (type.array.empty()) {
+					last_normal_sampler_name = r.name;
+				}
+				else {
+					last_array_sampler_name = r.name;
+				}
+				
+				if (!ep_args.empty())
+					ep_args += ", ";
+				ep_args += sampler_type(type, var_id, false) + " " + r.name;
 				ep_args += " [[sampler(" + convert_to_string(r.index) + ")]]";
+			}
+            else {
+                /*
+                auto* m = ir.find_meta(var.self);
+                if (m) {
+                    auto&& dec = m->decoration;
+                    auto&& vname = dec.alias;
+                    //sampler_reuses.insert(std::make_pair(vname, last_normal_sampler_name));
+                }
+                */
+				if (!last_normal_sampler_name.empty())
+                	sampler_reuses.insert(std::make_pair(r.name, last_normal_sampler_name));
+				else if (!last_array_sampler_name.empty())
+					sampler_reuses.insert(std::make_pair(r.name, last_array_sampler_name));
+            }
 			break;
 		case SPIRType::Image:
 		{
@@ -15620,7 +15662,8 @@ std::string CompilerMSL::sampler_type(const SPIRType &type, uint32_t id, bool me
 		}
 		else
 		{
-			return join("array<", sampler_type(parent, id, false), ", ", array_size, ">");
+            return "sampler";
+			//return join("array<", sampler_type(parent, id, false), ", ", array_size, ">");
 		}
 	}
 	else
