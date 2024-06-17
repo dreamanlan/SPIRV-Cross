@@ -12189,8 +12189,8 @@ string CompilerMSL::to_sampler_expression(uint32_t id)
 			return Compiler::to_name(img_id) + sampler_name_suffix;
 	}
 
-	auto img_expr = to_expression(expr_id);
-	auto index = img_expr.find_first_of('[');
+	auto expr = to_expression(expr_id);
+	auto index = expr.find_first_of('[');
 	
 	uint32_t samp_id = 0;
 	if (combined)
