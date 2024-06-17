@@ -6277,16 +6277,16 @@ void CompilerMSL::emit_custom_functions()
 			begin_scope();
 			// Work around texture::gather() requiring its component parameter to be a constant expression
 			statement("case component::x:");
-			statement("    rslts[i] = t.gather(s, spvForward<Tp>(params)..., int(coffsets[i]), component::x);");
+			statement("    rslts[i] = t.gather(s, spvForward<Tp>(params)..., int2(coffsets[i]), component::x);");
 			statement("    break;");
 			statement("case component::y:");
-			statement("    rslts[i] = t.gather(s, spvForward<Tp>(params)..., int(coffsets[i]), component::y);");
+			statement("    rslts[i] = t.gather(s, spvForward<Tp>(params)..., int2(coffsets[i]), component::y);");
 			statement("    break;");
 			statement("case component::z:");
-			statement("    rslts[i] = t.gather(s, spvForward<Tp>(params)..., int(coffsets[i]), component::z);");
+			statement("    rslts[i] = t.gather(s, spvForward<Tp>(params)..., int2(coffsets[i]), component::z);");
 			statement("    break;");
 			statement("case component::w:");
-			statement("    rslts[i] = t.gather(s, spvForward<Tp>(params)..., int(coffsets[i]), component::w);");
+			statement("    rslts[i] = t.gather(s, spvForward<Tp>(params)..., int2(coffsets[i]), component::w);");
 			statement("    break;");
 			end_scope();
 			end_scope();
@@ -6306,7 +6306,7 @@ void CompilerMSL::emit_custom_functions()
 			statement("vec<T, 4> rslts[4];");
 			statement("for (uint i = 0; i < 4; i++)");
 			begin_scope();
-			statement("    rslts[i] = t.gather_compare(s, spvForward<Tp>(params)..., int(coffsets[i]));");
+			statement("    rslts[i] = t.gather_compare(s, spvForward<Tp>(params)..., int2(coffsets[i]));");
 			end_scope();
 			// Pull all values from the i0j0 component of each gather footprint
 			statement("return vec<T, 4>(rslts[0].w, rslts[1].w, rslts[2].w, rslts[3].w);");
