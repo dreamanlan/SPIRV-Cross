@@ -15634,6 +15634,9 @@ const std::unordered_set<std::string> &CompilerMSL::get_illegal_func_names()
 {
 	static const unordered_set<string> illegal_func_names = {
 		"main",
+		"fragment",
+		"vertex",
+		"kernel",
 		"saturate",
 		"assert",
 		"fmin3",
