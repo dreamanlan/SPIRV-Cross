@@ -15113,13 +15113,33 @@ uint32_t CompilerMSL::get_metal_resource_index(SPIRVariable &var, SPIRType::Base
 		{
 		case SPIRType::Image:
 			set_extended_decoration(var.self, resource_decoration, remap.first.msl_texture + plane);
+            printf("msl_texture index:%d+plane:%d by bindings stage:%d basetype:%d desc set:%d binding:%d count:%d.\n", remap.first.msl_texture, plane, remap.first.stage, remap.first.basetype, remap.first.desc_set, remap.first.binding, remap.first.count);
 			return remap.first.msl_texture + plane;
 		case SPIRType::Sampler:
 			set_extended_decoration(var.self, resource_decoration, remap.first.msl_sampler);
+            printf("msl_sampler index:%d by bindings stage:%d basetype:%d desc set:%d binding:%d count:%d.\n", remap.first.msl_sampler, remap.first.stage, remap.first.basetype, remap.first.desc_set, remap.first.binding, remap.first.count);
 			return remap.first.msl_sampler;
 		default:
-			set_extended_decoration(var.self, resource_decoration, remap.first.msl_buffer);
-			return remap.first.msl_buffer;
+            switch (remap.first.basetype)
+            {
+                case SPIRType::Image:
+                    set_extended_decoration(var.self, resource_decoration, remap.first.msl_texture + plane);
+                    printf("msl_texture index:%d+plane:%d by bindings stage:%d basetype:%d desc set:%d binding:%d count:%d.var basetype:%d\n", remap.first.msl_texture, plane, remap.first.stage, remap.first.basetype, remap.first.desc_set, remap.first.binding, remap.first.count, basetype);
+                    return remap.first.msl_texture + plane;
+                case SPIRType::Sampler:
+                    set_extended_decoration(var.self, resource_decoration, remap.first.msl_sampler);
+                    printf("msl_sampler index:%d by bindings stage:%d basetype:%d desc set:%d binding:%d count:%d.var basetype:%d\n", remap.first.msl_sampler, remap.first.stage, remap.first.basetype, remap.first.desc_set, remap.first.binding, remap.first.count, basetype);
+                    return remap.first.msl_sampler;
+                case SPIRType::SampledImage:
+                    set_extended_decoration(var.self, resource_decoration, remap.first.msl_texture + plane);
+                    printf("(SampledImage) msl_texture index:%d+plane:%d by bindings stage:%d basetype:%d desc set:%d binding:%d count:%d.var basetype:%d\n", remap.first.msl_texture, plane, remap.first.stage, remap.first.basetype, remap.first.desc_set, remap.first.binding, remap.first.count, basetype);
+                    return remap.first.msl_texture + plane;
+                default:
+                    set_extended_decoration(var.self, resource_decoration, remap.first.msl_buffer);
+                    printf("msl_buffer index:%d by bindings stage:%d basetype:%d desc set:%d binding:%d count:%d.var basetype:%d\n", remap.first.msl_buffer, remap.first.stage, remap.first.basetype, remap.first.desc_set, remap.first.binding, remap.first.count, basetype);
+                    return remap.first.msl_buffer;
+            }
+            break;
 		}
 	}
 

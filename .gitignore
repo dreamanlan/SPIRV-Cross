@@ -5,6 +5,7 @@
 *.d
 *.txt
 /build
+/xcodebuild
 /test
 /spirv-cross
 /obj
