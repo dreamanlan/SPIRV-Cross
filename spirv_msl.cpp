@@ -274,16 +274,20 @@ void CompilerMSL::build_implicit_builtins()
 	     active_input_builtins.get(BuiltInInstanceIndex) || active_input_builtins.get(BuiltInBaseInstance));
 	bool need_local_invocation_index =
 		(msl_options.emulate_subgroups && active_input_builtins.get(BuiltInSubgroupId)) || is_mesh_shader() ||
-		needs_workgroup_zero_init;
+		needs_workgroup_zero_init || needs_local_invocation_index;
 	bool need_workgroup_size = msl_options.emulate_subgroups && active_input_builtins.get(BuiltInNumSubgroups);
 	bool force_frag_depth_passthrough =
 	    get_execution_model() == ExecutionModelFragment && !uses_explicit_early_fragment_test() && need_subpass_input &&
 	    msl_options.enable_frag_depth_builtin && msl_options.input_attachment_is_ds_attachment;
+	bool need_point_size =
+	    msl_options.enable_point_size_builtin && msl_options.enable_point_size_default &&
+	    get_execution_model() == ExecutionModelVertex;
 
 	if (need_subpass_input || need_sample_pos || need_subgroup_mask || need_vertex_params || need_tesc_params ||
 	    need_tese_params || need_multiview || need_dispatch_base || need_vertex_base_params || need_grid_params ||
 	    needs_sample_id || needs_subgroup_invocation_id || needs_subgroup_size || needs_helper_invocation ||
-	    has_additional_fixed_sample_mask() || need_local_invocation_index || need_workgroup_size || force_frag_depth_passthrough || is_mesh_shader())
+	    has_additional_fixed_sample_mask() || need_local_invocation_index || need_workgroup_size ||
+	    force_frag_depth_passthrough || need_point_size || is_mesh_shader())
 	{
 		bool has_frag_coord = false;
 		bool has_sample_id = false;
@@ -301,6 +305,7 @@ void CompilerMSL::build_implicit_builtins()
 		bool has_local_invocation_index = false;
 		bool has_workgroup_size = false;
 		bool has_frag_depth = false;
+		bool has_point_size = false;
 		uint32_t workgroup_id_type = 0;
 
 		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
@@ -308,6 +313,22 @@ void CompilerMSL::build_implicit_builtins()
 				return;
 			if (!interface_variable_exists_in_entry_point(var.self))
 				return;
+
+			auto &type = this->get<SPIRType>(var.basetype);
+			if (need_point_size && has_decoration(type.self, DecorationBlock))
+			{
+				const auto member_count = static_cast<uint32_t>(type.member_types.size());
+				for (uint32_t i = 0; i < member_count; i++)
+				{
+					if (get_member_decoration(type.self, i, DecorationBuiltIn) == BuiltInPointSize)
+					{
+						has_point_size = true;
+						active_output_builtins.set(BuiltInPointSize);
+						break;
+					}
+				}
+			}
+
 			if (!has_decoration(var.self, DecorationBuiltIn))
 				return;
 
@@ -328,6 +349,12 @@ void CompilerMSL::build_implicit_builtins()
 					mark_implicit_builtin(StorageClassOutput, BuiltInFragDepth, var.self);
 					has_frag_depth = true;
 				}
+			}
+
+			if (builtin == BuiltInPointSize)
+			{
+				has_point_size = true;
+				active_output_builtins.set(BuiltInPointSize);
 			}
 
 			if (builtin == BuiltInPrimitivePointIndicesEXT ||
@@ -954,6 +981,34 @@ void CompilerMSL::build_implicit_builtins()
 			builtin_frag_depth_id = var_id;
 			mark_implicit_builtin(StorageClassOutput, BuiltInFragDepth, var_id);
 			active_output_builtins.set(BuiltInFragDepth);
+		}
+
+		if (!has_point_size && need_point_size)
+		{
+			uint32_t offset = ir.increase_bound_by(3);
+			uint32_t type_id = offset;
+			uint32_t type_ptr_id = offset + 1;
+			uint32_t var_id = offset + 2;
+
+			// Create gl_PointSize
+			SPIRType float_type { OpTypeFloat };
+			float_type.basetype = SPIRType::Float;
+			float_type.width = 32;
+			float_type.vecsize = 1;
+			set<SPIRType>(type_id, float_type);
+
+			SPIRType float_type_ptr_in = float_type;
+			float_type_ptr_in.op = spv::OpTypePointer;
+			float_type_ptr_in.pointer = true;
+			float_type_ptr_in.pointer_depth++;
+			float_type_ptr_in.parent_type = type_id;
+			float_type_ptr_in.storage = StorageClassOutput;
+
+			auto &ptr_in_type = set<SPIRType>(type_ptr_id, float_type_ptr_in);
+			ptr_in_type.self = type_id;
+			set<SPIRVariable>(var_id, type_ptr_id, StorageClassOutput);
+			set_decoration(var_id, DecorationBuiltIn, BuiltInPointSize);
+			mark_implicit_builtin(StorageClassOutput, BuiltInPointSize, var_id);
 		}
 	}
 
@@ -1600,6 +1655,7 @@ string CompilerMSL::compile()
 	backend.basic_int16_type = "short";
 	backend.basic_uint16_type = "ushort";
 	backend.boolean_mix_function = "select";
+	backend.printf_function = "os_log_default.log";
 	backend.swizzle_is_function = false;
 	backend.shared_is_implied = false;
 	backend.use_initializer_list = true;
@@ -1802,6 +1858,8 @@ void CompilerMSL::preprocess_op_codes()
 		capture_output_to_buffer = true;
 	}
 
+	if (preproc.needs_local_invocation_index)
+		needs_local_invocation_index = true;
 	if (preproc.needs_subgroup_invocation_id)
 		needs_subgroup_invocation_id = true;
 	if (preproc.needs_subgroup_size)
@@ -2152,6 +2210,15 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
 				default:
 					break;
 				}
+				break;
+			}
+
+			case OpGroupNonUniformRotateKHR:
+			{
+				// Add the correct invocation ID for calculating clustered rotate case.
+				if (i.length > 5)
+					added_arg_ids.insert(static_cast<Scope>(evaluate_constant_u32(ops[2])) == ScopeSubgroup
+						? builtin_subgroup_invocation_id_id : builtin_local_invocation_index_id);
 				break;
 			}
 
@@ -3204,16 +3271,20 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 		bool has_var_loc_decor = has_decoration(var.self, DecorationLocation);
 		uint32_t orig_vecsize = UINT32_MAX;
 
-		if (has_member_loc_decor)
-			ir_location = get_member_decoration(var_type.self, mbr_idx, DecorationLocation);
-		else if (has_var_loc_decor)
-			ir_location = get_accumulated_member_location(var, mbr_idx, meta.strip_array);
-		else if (is_builtin)
+		// If we haven't established a location base yet, do so here.
+		if (location == UINT32_MAX)
 		{
-			if (is_tessellation_shader() && storage == StorageClassInput && inputs_by_builtin.count(builtin))
-				ir_location = inputs_by_builtin[builtin].location;
-			else if (capture_output_to_buffer && storage == StorageClassOutput && outputs_by_builtin.count(builtin))
-				ir_location = outputs_by_builtin[builtin].location;
+			if (has_member_loc_decor)
+				ir_location = get_member_decoration(var_type.self, mbr_idx, DecorationLocation);
+			else if (has_var_loc_decor)
+				ir_location = get_accumulated_member_location(var, mbr_idx, meta.strip_array);
+			else if (is_builtin)
+			{
+				if (is_tessellation_shader() && storage == StorageClassInput && inputs_by_builtin.count(builtin))
+					ir_location = inputs_by_builtin[builtin].location;
+				else if (capture_output_to_buffer && storage == StorageClassOutput && outputs_by_builtin.count(builtin))
+					ir_location = outputs_by_builtin[builtin].location;
+			}
 		}
 
 		// Once we determine the location of the first member within nested structures,
@@ -3756,6 +3827,20 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 		return;
 	}
 
+	// Tesselation stages pass I/O via buffer content which may contain nested structs.
+	// Ensure the vector sizes of any nested struct members within these input variables match
+	// the vector sizes of the corresponding output variables from the previous pipeline stage.
+	// This adjustment is handled here instead of ensure_correct_input_type() in order to
+	// perform the necessary recursive processing.
+	if (storage == StorageClassInput && var_type.basetype == SPIRType::Struct &&
+		((is_tesc_shader() && msl_options.multi_patch_workgroup) ||
+		 (is_tese_shader() && msl_options.raw_buffer_tese_input)) &&
+		has_decoration(var.self, DecorationLocation))
+	{
+		uint32_t locn = get_decoration(var.self, DecorationLocation);
+		ensure_struct_members_valid_vecsizes(get_variable_data_type(var), locn);
+	}
+
 	if (storage == StorageClassInput && has_decoration(var.self, DecorationPerVertexKHR))
 		SPIRV_CROSS_THROW("PerVertexKHR decoration is not supported in MSL.");
 
@@ -3947,6 +4032,43 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 			{
 				add_plain_variable_to_interface_block(storage, ib_var_ref, ib_type, var, meta);
 			}
+		}
+	}
+}
+
+// Recursively iterate into the input struct type, and adjust the vecsize
+// of any nested members, based on location info provided through the API.
+// The location parameter is modified recursively.
+void CompilerMSL::ensure_struct_members_valid_vecsizes(SPIRType &struct_type, uint32_t &location)
+{
+	assert(struct_type.basetype == SPIRType::Struct);
+
+	auto mbr_cnt = struct_type.member_types.size();
+	for (size_t mbr_idx = 0; mbr_idx < mbr_cnt; mbr_idx++)
+	{
+		auto mbr_type_id = struct_type.member_types[mbr_idx];
+		auto &mbr_type = get<SPIRType>(mbr_type_id);
+
+		if (mbr_type.basetype == SPIRType::Struct)
+			ensure_struct_members_valid_vecsizes(mbr_type, location);
+		else
+		{
+			auto p_va = inputs_by_location.find({location, 0});
+			if (p_va != end(inputs_by_location) && p_va->second.vecsize > mbr_type.vecsize)
+			{
+				// Set a new member type into the struct type, and all its parent types.
+				auto new_mbr_type_id = build_extended_vector_type(mbr_type_id, p_va->second.vecsize);
+				for (auto *p_type = &struct_type; p_type; p_type = maybe_get<SPIRType>(p_type->parent_type))
+					p_type->member_types[mbr_idx] = new_mbr_type_id;
+			}
+
+			// Calc location of next member
+			uint32_t loc_cnt = mbr_type.columns;
+			auto dim_cnt = mbr_type.array.size();
+			for (uint32_t i = 0; i < dim_cnt; i++)
+				loc_cnt *= to_array_size_literal(mbr_type, i);
+
+			location += loc_cnt;
 		}
 	}
 }
@@ -5867,6 +5989,17 @@ void CompilerMSL::emit_custom_functions()
 	{
 		switch (spv_func)
 		{
+		case SPVFuncImplSMod:
+			statement("// Implementation of signed integer mod accurate to SPIR-V specification");
+			statement("template<typename Tx, typename Ty>");
+			statement("inline Tx spvSMod(Tx x, Ty y)");
+			begin_scope();
+			statement("Tx remainder = x - y * (x / y);");
+			statement("return select(Tx(remainder + y), remainder, remainder == 0 || (x >= 0) == (y >= 0));");
+			end_scope();
+			statement("");
+			break;
+
 		case SPVFuncImplMod:
 			statement("// Implementation of the GLSL mod() function, which is slightly different than Metal fmod()");
 			statement("template<typename Tx, typename Ty>");
@@ -6863,6 +6996,36 @@ void CompilerMSL::emit_custom_functions()
 			statement("");
 			break;
 
+		case SPVFuncImplSubgroupRotate:
+			statement("template<typename T>");
+			statement("inline T spvSubgroupRotate(T value, ushort delta)");
+			begin_scope();
+			if (msl_options.use_quadgroup_operation())
+				statement("return quad_shuffle_rotate_down(value, delta);");
+			else
+				statement("return simd_shuffle_rotate_down(value, delta);");
+			end_scope();
+			statement("");
+			statement("template<>");
+			statement("inline bool spvSubgroupRotate(bool value, ushort delta)");
+			begin_scope();
+			if (msl_options.use_quadgroup_operation())
+				statement("return !!quad_shuffle_rotate_down((ushort)value, delta);");
+			else
+				statement("return !!simd_shuffle_rotate_down((ushort)value, delta);");
+			end_scope();
+			statement("");
+			statement("template<uint N>");
+			statement("inline vec<bool, N> spvSubgroupRotate(vec<bool, N> value, ushort delta)");
+			begin_scope();
+			if (msl_options.use_quadgroup_operation())
+				statement("return (vec<bool, N>)quad_shuffle_rotate_down((vec<ushort, N>)value, delta);");
+			else
+				statement("return (vec<bool, N>)simd_shuffle_rotate_down((vec<ushort, N>)value, delta);");
+			end_scope();
+			statement("");
+			break;
+
 		case SPVFuncImplQuadBroadcast:
 			statement("template<typename T>");
 			statement("inline T spvQuadBroadcast(T value, uint lane)");
@@ -7816,6 +7979,26 @@ void CompilerMSL::emit_custom_functions()
 			end_scope();
 			end_scope();
 			statement("");
+			break;
+
+		case SPVFuncImplAssume:
+			statement_no_indent("#if defined(__has_builtin)");
+			statement_no_indent("#if !defined(SPV_ASSUME) && __has_builtin(__builtin_assume)");
+			statement_no_indent("#define SPV_ASSUME(x) __builtin_assume(x);");
+			statement_no_indent("#endif");
+			statement_no_indent("#if !defined(SPV_EXPECT) && __has_builtin(__builtin_expect)");
+			statement_no_indent("#define SPV_EXPECT(x, y) __builtin_expect(x, y);");
+			statement_no_indent("#endif");
+			statement_no_indent("#endif");
+
+			statement_no_indent("#ifndef SPV_ASSUME");
+			statement_no_indent("#define SPV_ASSUME(x)");
+			statement_no_indent("#endif");
+
+			statement_no_indent("#ifndef SPV_EXPECT");
+			statement_no_indent("#define SPV_EXPECT(x, y) x");
+			statement_no_indent("#endif");
+
 			break;
 
 		default:
@@ -9170,6 +9353,10 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 	}
 
+	case OpSMod:
+		MSL_BFOP(spvSMod);
+		break;
+
 	case OpFRem:
 		MSL_BFOP(fmod);
 		break;
@@ -9640,6 +9827,9 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		if (needs_frag_discard_checks() &&
 		    (type.storage == StorageClassStorageBuffer || type.storage == StorageClassUniform))
 			end_scope();
+		if (has_decoration(ops[0], DecorationBuiltIn) && get_decoration(ops[0], DecorationBuiltIn) == BuiltInPointSize)
+			writes_to_point_size = true;
+
 		break;
 	}
 
@@ -10168,6 +10358,27 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		flush_variable_declaration(builtin_mesh_primitive_indices_id);
 		add_spv_func_and_recompile(SPVFuncImplSetMeshOutputsEXT);
 		statement("spvSetMeshOutputsEXT(gl_LocalInvocationIndex, spvMeshSizes, ", to_unpacked_expression(ops[0]), ", ", to_unpacked_expression(ops[1]), ");");
+		break;
+	}
+
+	case OpAssumeTrueKHR:
+	{
+		auto condition = ops[0];
+		statement(join("SPV_ASSUME(", to_unpacked_expression(condition), ")"));
+		break;
+	}
+
+	case OpExpectKHR:
+	{
+		auto result_type = ops[0];
+		auto ret = ops[1];
+		auto value = ops[2];
+		auto exp_value = ops[3];
+
+		auto exp = join("SPV_EXPECT(", to_unpacked_expression(value), ", ", to_unpacked_expression(exp_value), ")");
+		emit_op(result_type, ret, exp, should_forward(value), should_forward(exp_value));
+		inherit_expression_dependencies(ret, value);
+		inherit_expression_dependencies(ret, exp_value);
 		break;
 	}
 
@@ -12633,6 +12844,9 @@ void CompilerMSL::emit_fixup()
 {
 	if (is_vertex_like_shader() && stage_out_var_id && !qual_pos_var_name.empty() && !capture_output_to_buffer)
 	{
+		if (msl_options.enable_point_size_default && !writes_to_point_size)
+			statement(builtin_to_glsl(BuiltInPointSize, StorageClassOutput), " = ", format_float(msl_options.default_point_size), ";");
+
 		if (options.vertex.fixup_clipspace)
 			statement(qual_pos_var_name, ".z = (", qual_pos_var_name, ".z + ", qual_pos_var_name,
 			          ".w) * 0.5;       // Adjust clip-space for Metal");
@@ -16216,6 +16430,9 @@ string CompilerMSL::constant_op_expression(const SPIRConstantOp &cop)
 {
 	switch (cop.opcode)
 	{
+	case OpSMod:
+		add_spv_func_and_recompile(SPVFuncImplSMod);
+		return join("spvSMod(", to_expression(cop.arguments[0]), ", ", to_expression(cop.arguments[1]), ")");
 	case OpQuantizeToF16:
 		add_spv_func_and_recompile(SPVFuncImplQuantizeToF16);
 		return join("spvQuantizeToF16(", to_expression(cop.arguments[0]), ")");
@@ -16591,6 +16808,10 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
 			if (!msl_options.supports_msl_version(2, 2))
 				SPIRV_CROSS_THROW("Ballot ops on iOS requires Metal 2.2 and up.");
 			break;
+		case OpGroupNonUniformRotateKHR:
+			if (!msl_options.supports_msl_version(2, 2))
+				SPIRV_CROSS_THROW("Rotate on iOS requires Metal 2.2 and up.");
+			break;
 		case OpGroupNonUniformBroadcast:
 		case OpGroupNonUniformShuffle:
 		case OpGroupNonUniformShuffleXor:
@@ -16626,13 +16847,16 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
 	Scope scope;
 	switch (op)
 	{
+	// These earlier instructions don't have the scope operand.
 	case OpSubgroupBallotKHR:
 	case OpSubgroupFirstInvocationKHR:
 	case OpSubgroupReadInvocationKHR:
 	case OpSubgroupAllKHR:
 	case OpSubgroupAnyKHR:
 	case OpSubgroupAllEqualKHR:
-		// These earlier instructions don't have the scope operand.
+	// These instructions are always quad-scoped and thus do not have a scope operand.
+	case OpGroupNonUniformQuadAllKHR:
+	case OpGroupNonUniformQuadAnyKHR:
 		scope = ScopeSubgroup;
 		break;
 	default:
@@ -16719,6 +16943,23 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
 	case OpGroupNonUniformShuffleDown:
 		emit_binary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], "spvSubgroupShuffleDown");
 		break;
+
+	case OpGroupNonUniformRotateKHR:
+	{
+		if (i.length > 5)
+		{
+			// MSL does not have a cluster size parameter, so calculate the invocation ID manually and using a shuffle.
+			auto delta_expr = enclose_expression(to_unpacked_expression(ops[op_idx + 1]));
+			auto cluster_size_minus_one = evaluate_constant_u32(ops[op_idx + 2]) - 1;
+			auto local_id_expr = to_unpacked_expression(scope == ScopeSubgroup
+				? builtin_subgroup_invocation_id_id : builtin_local_invocation_index_id);
+			auto shuffle_idx = join("((", local_id_expr, " + ", delta_expr, ")", " & ", std::to_string(cluster_size_minus_one),
+				") + (", local_id_expr, " & ", std::to_string(~cluster_size_minus_one), ")");
+			emit_op(result_type, id, join("spvSubgroupShuffle(", to_unpacked_expression(ops[op_idx]), ", ", shuffle_idx, ")"), false);
+		} else
+			emit_binary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], "spvSubgroupRotate");
+		break;
+	}
 
 	case OpGroupNonUniformAll:
 	case OpSubgroupAllKHR:
@@ -16839,6 +17080,14 @@ case OpGroupNonUniform##op: \
 
 	case OpGroupNonUniformQuadBroadcast:
 		emit_binary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], "spvQuadBroadcast");
+		break;
+
+	case OpGroupNonUniformQuadAllKHR:
+		emit_unary_func_op(result_type, id, ops[op_idx], "quad_all");
+		break;
+
+	case OpGroupNonUniformQuadAnyKHR:
+		emit_unary_func_op(result_type, id, ops[op_idx], "quad_any");
 		break;
 
 	default:
@@ -17801,7 +18050,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 	// suppress_missing_prototypes to suppress compiler warnings of missing function prototypes.
 
 	// Mark if the input requires the implementation of an SPIR-V function that does not exist in Metal.
-	SPVFuncImpl spv_func = get_spv_func_impl(opcode, args);
+	SPVFuncImpl spv_func = get_spv_func_impl(opcode, args, length);
 	if (spv_func != SPVFuncImplNone)
 	{
 		compiler.spv_function_implementations.insert(spv_func);
@@ -17908,6 +18157,17 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 			needs_subgroup_invocation_id = true;
 		break;
 
+	case OpGroupNonUniformRotateKHR:
+		// Add the correct invocation ID for calculating clustered rotate case.
+		if (length > 5)
+		{
+			if (static_cast<Scope>(compiler.evaluate_constant_u32(args[2])) == ScopeSubgroup)
+				needs_subgroup_invocation_id = true;
+			else
+				needs_local_invocation_index = true;
+		}
+		break;
+
 	case OpArrayLength:
 	{
 		auto *var = compiler.maybe_get_backing_variable(args[2]);
@@ -17937,7 +18197,8 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 	case OpExtInst:
 	{
 		uint32_t extension_set = args[2];
-		if (compiler.get<SPIRExtension>(extension_set).ext == SPIRExtension::GLSL)
+		SPIRExtension::Extension ext = compiler.get<SPIRExtension>(extension_set).ext;
+		if (ext == SPIRExtension::GLSL)
 		{
 			auto op_450 = static_cast<GLSLstd450>(args[3]);
 			switch (op_450)
@@ -17980,6 +18241,12 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 				break;
 			}
 		}
+		else if (ext == SPIRExtension::NonSemanticDebugPrintf)
+		{
+			// Operation 1 is printf.
+			if (args[3] == 1 && !compiler.msl_options.supports_msl_version(3, 2))
+				SPIRV_CROSS_THROW("Debug printf requires MSL 3.2.");
+		}
 		break;
 	}
 
@@ -18010,10 +18277,13 @@ void CompilerMSL::OpCodePreprocessor::check_resource_write(uint32_t var_id)
 }
 
 // Returns an enumeration of a SPIR-V function that needs to be output for certain Op codes.
-CompilerMSL::SPVFuncImpl CompilerMSL::OpCodePreprocessor::get_spv_func_impl(Op opcode, const uint32_t *args)
+CompilerMSL::SPVFuncImpl CompilerMSL::OpCodePreprocessor::get_spv_func_impl(Op opcode, const uint32_t *args, uint32_t length)
 {
 	switch (opcode)
 	{
+	case OpSMod:
+		return SPVFuncImplSMod;
+
 	case OpFMod:
 		return SPVFuncImplMod;
 
@@ -18192,6 +18462,12 @@ CompilerMSL::SPVFuncImpl CompilerMSL::OpCodePreprocessor::get_spv_func_impl(Op o
 	case OpGroupNonUniformShuffleDown:
 		return SPVFuncImplSubgroupShuffleDown;
 
+	case OpGroupNonUniformRotateKHR:
+		// Clustered rotate is performed using shuffle.
+		if (length > 5)
+			return SPVFuncImplSubgroupShuffle;
+		return SPVFuncImplSubgroupRotate;
+
 	case OpGroupNonUniformQuadBroadcast:
 		return SPVFuncImplQuadBroadcast;
 
@@ -18209,6 +18485,10 @@ CompilerMSL::SPVFuncImpl CompilerMSL::OpCodePreprocessor::get_spv_func_impl(Op o
 	case OpSMulExtended:
 	case OpUMulExtended:
 		return SPVFuncImplMulExtended;
+
+	case OpAssumeTrueKHR:
+	case OpExpectKHR:
+		return SPVFuncImplAssume;
 
 	default:
 		break;

@@ -631,6 +631,12 @@ void CompilerGLSL::find_static_extensions()
 		require_extension_internal("GL_OVR_multiview2");
 	}
 
+	if (execution.flags.get(ExecutionModeQuadDerivativesKHR) ||
+	    (execution.flags.get(ExecutionModeRequireFullQuadsKHR) && get_execution_model() == ExecutionModelFragment))
+	{
+		require_extension_internal("GL_EXT_shader_quad_control");
+	}
+
 	// KHR one is likely to get promoted at some point, so if we don't see an explicit SPIR-V extension, assume KHR.
 	for (auto &ext : ir.declared_extensions)
 		if (ext == "SPV_NV_fragment_shader_barycentric")
@@ -1193,6 +1199,9 @@ void CompilerGLSL::emit_header()
 		else if (!options.es && execution.flags.get(ExecutionModeDepthLess))
 			statement("layout(depth_less) out float gl_FragDepth;");
 
+		if (execution.flags.get(ExecutionModeRequireFullQuadsKHR))
+			statement("layout(full_quads) in;");
+
 		break;
 
 	default:
@@ -1202,6 +1211,9 @@ void CompilerGLSL::emit_header()
 	for (auto &cap : ir.declared_capabilities)
 		if (cap == CapabilityRayTraversalPrimitiveCullingKHR)
 			statement("layout(primitive_culling);");
+
+	if (execution.flags.get(ExecutionModeQuadDerivativesKHR))
+		statement("layout(quad_derivatives) in;");
 
 	if (!inputs.empty())
 		statement("layout(", merge(inputs), ") in;");
@@ -6111,7 +6123,9 @@ string CompilerGLSL::convert_half_to_string(const SPIRConstant &c, uint32_t col,
 string CompilerGLSL::convert_float_to_string(const SPIRConstant &c, uint32_t col, uint32_t row)
 {
 	string res;
-	float float_value = c.scalar_f32(col, row);
+
+	bool is_bfloat16 = get<SPIRType>(c.constant_type).basetype == SPIRType::BFloat16;
+	float float_value = is_bfloat16 ? c.scalar_bf16(col, row) : c.scalar_f32(col, row);
 
 	if (std::isnan(float_value) || std::isinf(float_value))
 	{
@@ -6174,6 +6188,9 @@ string CompilerGLSL::convert_float_to_string(const SPIRConstant &c, uint32_t col
 		if (backend.float_literal_suffix)
 			res += "f";
 	}
+
+	if (is_bfloat16)
+		res = join("bfloat16_t(", res, ")");
 
 	return res;
 }
@@ -6353,6 +6370,7 @@ string CompilerGLSL::constant_expression_vector(const SPIRConstant &c, uint32_t 
 		}
 		break;
 
+	case SPIRType::BFloat16:
 	case SPIRType::Float:
 		if (splat || swizzle_splat)
 		{
@@ -9381,6 +9399,10 @@ void CompilerGLSL::emit_subgroup_op(const Instruction &i)
 		require_extension_internal("GL_KHR_shader_subgroup_shuffle_relative");
 		break;
 
+	case OpGroupNonUniformRotateKHR:
+		require_extension_internal("GL_KHR_shader_subgroup_rotate");
+		break;
+
 	case OpGroupNonUniformAll:
 	case OpGroupNonUniformAny:
 	case OpGroupNonUniformAllEqual:
@@ -9452,6 +9474,13 @@ void CompilerGLSL::emit_subgroup_op(const Instruction &i)
 		require_extension_internal("GL_KHR_shader_subgroup_quad");
 		break;
 
+	case OpGroupNonUniformQuadAllKHR:
+	case OpGroupNonUniformQuadAnyKHR:
+		// Require both extensions to be enabled.
+		require_extension_internal("GL_KHR_shader_subgroup_vote");
+		require_extension_internal("GL_EXT_shader_quad_control");
+		break;
+
 	default:
 		SPIRV_CROSS_THROW("Invalid opcode for subgroup.");
 	}
@@ -9459,9 +9488,13 @@ void CompilerGLSL::emit_subgroup_op(const Instruction &i)
 	uint32_t result_type = ops[0];
 	uint32_t id = ops[1];
 
-	auto scope = static_cast<Scope>(evaluate_constant_u32(ops[2]));
-	if (scope != ScopeSubgroup)
-		SPIRV_CROSS_THROW("Only subgroup scope is supported.");
+	// These quad ops do not have a scope parameter.
+	if (op != OpGroupNonUniformQuadAllKHR && op != OpGroupNonUniformQuadAnyKHR)
+	{
+		auto scope = static_cast<Scope>(evaluate_constant_u32(ops[2]));
+		if (scope != ScopeSubgroup)
+			SPIRV_CROSS_THROW("Only subgroup scope is supported.");
+	}
 
 	switch (op)
 	{
@@ -9525,6 +9558,13 @@ void CompilerGLSL::emit_subgroup_op(const Instruction &i)
 
 	case OpGroupNonUniformShuffleDown:
 		emit_binary_func_op(result_type, id, ops[3], ops[4], "subgroupShuffleDown");
+		break;
+
+	case OpGroupNonUniformRotateKHR:
+		if (i.length > 5)
+			emit_trinary_func_op(result_type, id, ops[3], ops[4], ops[5], "subgroupClusteredRotate");
+		else
+			emit_binary_func_op(result_type, id, ops[3], ops[4], "subgroupRotate");
 		break;
 
 	case OpGroupNonUniformAll:
@@ -9613,6 +9653,14 @@ case OpGroupNonUniform##op: \
 		emit_binary_func_op(result_type, id, ops[3], ops[4], "subgroupQuadBroadcast");
 		break;
 	}
+
+	case OpGroupNonUniformQuadAllKHR:
+		emit_unary_func_op(result_type, id, ops[2], "subgroupQuadAll");
+		break;
+
+	case OpGroupNonUniformQuadAnyKHR:
+		emit_unary_func_op(result_type, id, ops[2], "subgroupQuadAny");
+		break;
 
 	default:
 		SPIRV_CROSS_THROW("Invalid opcode for subgroup.");
@@ -9729,6 +9777,14 @@ string CompilerGLSL::bitcast_glsl_op(const SPIRType &out_type, const SPIRType &i
 		return "packUint4x16";
 	else if (out_type.basetype == SPIRType::UShort && in_type.basetype == SPIRType::UInt64 && in_type.vecsize == 1)
 		return "unpackUint4x16";
+	else if (out_type.basetype == SPIRType::BFloat16 && in_type.basetype == SPIRType::UShort)
+		return "uintBitsToBFloat16EXT";
+	else if (out_type.basetype == SPIRType::BFloat16 && in_type.basetype == SPIRType::Short)
+		return "intBitsToBFloat16EXT";
+	else if (out_type.basetype == SPIRType::UShort && in_type.basetype == SPIRType::BFloat16)
+		return "bfloat16BitsToUintEXT";
+	else if (out_type.basetype == SPIRType::Short && in_type.basetype == SPIRType::BFloat16)
+		return "bfloat16BitsToIntEXT";
 
 	return "";
 }
@@ -14860,7 +14916,7 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 					SPIRV_CROSS_THROW("Debug printf is only supported in Vulkan GLSL.\n");
 				require_extension_internal("GL_EXT_debug_printf");
 				auto &format_string = get<SPIRString>(ops[4]).str;
-				string expr = join("debugPrintfEXT(\"", format_string, "\"");
+				string expr = join(backend.printf_function, "(\"", format_string, "\"");
 				for (uint32_t i = 5; i < length; i++)
 				{
 					expr += ", ";
@@ -15059,6 +15115,9 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 	case OpGroupNonUniformLogicalXor:
 	case OpGroupNonUniformQuadSwap:
 	case OpGroupNonUniformQuadBroadcast:
+	case OpGroupNonUniformQuadAllKHR:
+	case OpGroupNonUniformQuadAnyKHR:
+	case OpGroupNonUniformRotateKHR:
 		emit_subgroup_op(instruction);
 		break;
 
@@ -15421,12 +15480,27 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 		if (!is_forcing_recompilation())
 			split_expr = split_coopmat_pointer(expr);
 
+		string layout_expr;
+		if (const auto *layout = maybe_get<SPIRConstant>(ops[3]))
+		{
+			if (!layout->specialization)
+			{
+				if (layout->scalar() == spv::CooperativeMatrixLayoutColumnMajorKHR)
+					layout_expr = "gl_CooperativeMatrixLayoutColumnMajor";
+				else
+					layout_expr = "gl_CooperativeMatrixLayoutRowMajor";
+			}
+		}
+
+		if (layout_expr.empty())
+			layout_expr = join("int(", to_expression(ops[3]), ")");
+
 		statement("coopMatLoad(",
 		          to_expression(id), ", ",
 		          split_expr.first, ", ",
 		          split_expr.second, ", ",
 		          to_expression(ops[4]), ", ",
-		          to_expression(ops[3]), ");");
+		          layout_expr, ");");
 
 		register_read(id, ops[2], false);
 		break;
@@ -15446,12 +15520,27 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 		if (!is_forcing_recompilation())
 			split_expr = split_coopmat_pointer(expr);
 
+		string layout_expr;
+		if (const auto *layout = maybe_get<SPIRConstant>(ops[2]))
+		{
+			if (!layout->specialization)
+			{
+				if (layout->scalar() == spv::CooperativeMatrixLayoutColumnMajorKHR)
+					layout_expr = "gl_CooperativeMatrixLayoutColumnMajor";
+				else
+					layout_expr = "gl_CooperativeMatrixLayoutRowMajor";
+			}
+		}
+
+		if (layout_expr.empty())
+			layout_expr = join("int(", to_expression(ops[2]), ")");
+
 		statement("coopMatStore(",
 		          to_expression(ops[1]), ", ",
 		          split_expr.first, ", ",
 		          split_expr.second, ", ",
 		          to_expression(ops[3]), ", ",
-		          to_expression(ops[2]), ");");
+		          layout_expr, ");");
 
 		// TODO: Do we care about memory operands?
 
@@ -16360,8 +16449,26 @@ string CompilerGLSL::type_to_glsl(const SPIRType &type, uint32_t id)
 			SPIRV_CROSS_THROW("Invalid matrix use.");
 		}
 
+		string scope_expr;
+		if (const auto *scope = maybe_get<SPIRConstant>(coop_type->cooperative.scope_id))
+		{
+			if (!scope->specialization)
+			{
+				require_extension_internal("GL_KHR_memory_scope_semantics");
+				if (scope->scalar() == spv::ScopeSubgroup)
+					scope_expr = "gl_ScopeSubgroup";
+				else if (scope->scalar() == spv::ScopeWorkgroup)
+					scope_expr = "gl_ScopeWorkgroup";
+				else
+					SPIRV_CROSS_THROW("Invalid scope for cooperative matrix.");
+			}
+		}
+
+		if (scope_expr.empty())
+			scope_expr = to_expression(coop_type->cooperative.scope_id);
+
 		return join("coopmat<", type_to_glsl(get<SPIRType>(coop_type->parent_type)), ", ",
-		            to_expression(coop_type->cooperative.scope_id), ", ",
+		            scope_expr, ", ",
 		            to_expression(coop_type->cooperative.rows_id), ", ",
 		            to_expression(coop_type->cooperative.columns_id), ", ", use, ">");
 	}
@@ -16388,6 +16495,11 @@ string CompilerGLSL::type_to_glsl(const SPIRType &type, uint32_t id)
 			return "atomic_uint";
 		case SPIRType::Half:
 			return "float16_t";
+		case SPIRType::BFloat16:
+			if (!options.vulkan_semantics)
+				SPIRV_CROSS_THROW("bfloat16 requires Vulkan semantics.");
+			require_extension_internal("GL_EXT_bfloat16");
+			return "bfloat16_t";
 		case SPIRType::Float:
 			return "float";
 		case SPIRType::Double:
@@ -16420,6 +16532,11 @@ string CompilerGLSL::type_to_glsl(const SPIRType &type, uint32_t id)
 			return join("uvec", type.vecsize);
 		case SPIRType::Half:
 			return join("f16vec", type.vecsize);
+		case SPIRType::BFloat16:
+			if (!options.vulkan_semantics)
+				SPIRV_CROSS_THROW("bfloat16 requires Vulkan semantics.");
+			require_extension_internal("GL_EXT_bfloat16");
+			return join("bf16vec", type.vecsize);
 		case SPIRType::Float:
 			return join("vec", type.vecsize);
 		case SPIRType::Double:
@@ -16595,6 +16712,11 @@ void CompilerGLSL::add_function_overload(const SPIRFunction &func)
 		// but that will not change the signature in GLSL/HLSL,
 		// so strip the pointer type before hashing.
 		uint32_t type_id = get_pointee_type_id(arg.type);
+
+		// Workaround glslang bug. It seems to only consider the base type when resolving overloads.
+		if (get<SPIRType>(type_id).op == spv::OpTypeCooperativeMatrixKHR)
+			type_id = get<SPIRType>(type_id).parent_type;
+
 		auto &type = get<SPIRType>(type_id);
 
 		if (!combined_image_samplers.empty())

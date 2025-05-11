@@ -324,6 +324,8 @@ public:
 		// of the shader with the additional fixed sample mask.
 		uint32_t additional_fixed_sample_mask = 0xffffffff;
 		bool enable_point_size_builtin = true;
+		bool enable_point_size_default = false;
+		float default_point_size = 1.0f;
 		bool enable_frag_depth_builtin = true;
 		bool enable_frag_stencil_ref_builtin = true;
 		bool disable_rasterization = false;
@@ -772,6 +774,7 @@ protected:
 	{
 		SPVFuncImplNone,
 		SPVFuncImplMod,
+		SPVFuncImplSMod,
 		SPVFuncImplRadians,
 		SPVFuncImplDegrees,
 		SPVFuncImplFindILsb,
@@ -814,6 +817,7 @@ protected:
 		SPVFuncImplSubgroupShuffleXor,
 		SPVFuncImplSubgroupShuffleUp,
 		SPVFuncImplSubgroupShuffleDown,
+		SPVFuncImplSubgroupRotate,
 		SPVFuncImplQuadBroadcast,
 		SPVFuncImplQuadSwap,
 		SPVFuncImplReflectScalar,
@@ -849,6 +853,7 @@ protected:
 		SPVFuncImplTextureCast,
 		SPVFuncImplMulExtended,
 		SPVFuncImplSetMeshOutputsEXT,
+		SPVFuncImplAssume,
 	};
 
 	// If the underlying resource has been used for comparison then duplicate loads of that resource must be too
@@ -994,6 +999,7 @@ protected:
 	void add_tess_level_input_to_interface_block(const std::string &ib_var_ref, SPIRType &ib_type, SPIRVariable &var);
 	void add_tess_level_input(const std::string &base_ref, const std::string &mbr_name, SPIRVariable &var);
 
+	void ensure_struct_members_valid_vecsizes(SPIRType &struct_type, uint32_t &location);
 	void fix_up_interface_member_indices(spv::StorageClass storage, uint32_t ib_type_id);
 
 	void mark_location_as_used_by_shader(uint32_t location, const SPIRType &type,
@@ -1221,12 +1227,14 @@ protected:
 	bool needs_swizzle_buffer_def = false;
 	bool used_swizzle_buffer = false;
 	bool added_builtin_tess_level = false;
+	bool needs_local_invocation_index = false;
 	bool needs_subgroup_invocation_id = false;
 	bool needs_subgroup_size = false;
 	bool needs_sample_id = false;
 	bool needs_helper_invocation = false;
 	bool needs_workgroup_zero_init = false;
 	bool writes_to_depth = false;
+	bool writes_to_point_size = false;
 	std::string qual_pos_var_name;
 	std::string stage_in_var_name = "in";
 	std::string stage_out_var_name = "out";
@@ -1325,7 +1333,7 @@ protected:
 		}
 
 		bool handle(spv::Op opcode, const uint32_t *args, uint32_t length) override;
-		CompilerMSL::SPVFuncImpl get_spv_func_impl(spv::Op opcode, const uint32_t *args);
+		CompilerMSL::SPVFuncImpl get_spv_func_impl(spv::Op opcode, const uint32_t *args, uint32_t length);
 		void check_resource_write(uint32_t var_id);
 
 		CompilerMSL &compiler;
@@ -1336,6 +1344,7 @@ protected:
 		bool uses_image_write = false;
 		bool uses_buffer_write = false;
 		bool uses_discard = false;
+		bool needs_local_invocation_index = false;
 		bool needs_subgroup_invocation_id = false;
 		bool needs_subgroup_size = false;
 		bool needs_sample_id = false;
