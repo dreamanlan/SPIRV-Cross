@@ -14070,7 +14070,7 @@ string CompilerMSL::get_type_address_space(const SPIRType &type, uint32_t id, bo
 		// If rasterization is not disabled in vertex/tese, Metal does not allow side effects and refuses to compile "device",
 		// even if there are no writes. Just force const device.
 		if (entry_point_requires_const_device_buffers())
-			addr_space = "const device";
+            addr_space = "device";//"const device";
 		else
 			addr_space = "device";
 		break;
