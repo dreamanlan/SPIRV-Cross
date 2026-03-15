@@ -1404,6 +1404,7 @@ protected:
 		bool needs_subgroup_size = false;
 		bool needs_sample_id = false;
 		bool needs_helper_invocation = false;
+		bool uses_cooperative_matrix = false;
 	};
 
 	// OpcodeHandler that scans for uses of sampled images
