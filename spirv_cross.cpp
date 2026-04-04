@@ -590,7 +590,18 @@ uint32_t Compiler::expression_type_id(uint32_t id) const
 		return get<SPIRAccessChain>(id).basetype;
 
 	default:
-		SPIRV_CROSS_THROW("Cannot resolve expression type.");
+	{
+		auto id_type = ir.ids[id].get_type();
+		const char* type_names[] = {
+			"TypeNone", "TypeType", "TypeVariable", "TypeConstant",
+			"TypeFunction", "TypeFunctionPrototype", "TypeBlock", "TypeExtension",
+			"TypeExpression", "TypeConstantOp", "TypeCombinedImageSampler",
+			"TypeAccessChain", "TypeUndef", "TypeString", "TypeDebugLocalVariable", "TypeCount"
+		};
+		const char* type_name = (id_type < TypeCount) ? type_names[id_type] : "Unknown";
+		SPIRV_CROSS_THROW("Cannot resolve expression type for ID " + std::to_string(id) +
+		                  " (type: " + type_name + ", raw: " + std::to_string(static_cast<int>(id_type)) + ").");
+	}
 	}
 }
 
